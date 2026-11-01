@@ -3,6 +3,7 @@
 use std::{
     cell::{Cell, RefCell},
     cmp::Ordering,
+    collections::HashMap,
     fmt::{Debug, Display},
     ops::{Add, Neg, Sub},
 };
@@ -262,6 +263,10 @@ struct Games<'a> {
     add_calls: Cell<usize>,
     game_calls: Cell<usize>,
     neg_calls: Cell<usize>,
+    game_table: RefCell<HashMap<(Vec<usize>, Vec<usize>), &'a Game<'a>>>,
+    add_table: RefCell<HashMap<(usize, usize), &'a Game<'a>>>,
+    le_table: RefCell<HashMap<(usize, usize), bool>>,
+    neg_table: RefCell<HashMap<usize, &'a Game<'a>>>,
 }
 
 impl<'a> Games<'a> {
@@ -273,6 +278,10 @@ impl<'a> Games<'a> {
             add_calls: Cell::new(0),
             game_calls: Cell::new(0),
             neg_calls: Cell::new(0),
+            game_table: RefCell::new(HashMap::new()),
+            add_table: RefCell::new(HashMap::new()),
+            le_table: RefCell::new(HashMap::new()),
+            neg_table: RefCell::new(HashMap::new()),
         }
     }
 
@@ -287,6 +296,10 @@ impl<'a> Games<'a> {
             self.slices.bytes_used(),
             self.slices.bytes_reserved()
         );
+        println!("game table len: {}", self.game_table.borrow().len());
+        println!("add table len: {}", self.add_table.borrow().len());
+        println!("le table len: {}", self.le_table.borrow().len());
+        println!("neg table len: {}", self.neg_table.borrow().len());
         println!("le calls: {}", self.le_calls.get());
         println!("add calls: {}", self.add_calls.get());
         println!("game calls: {}", self.game_calls.get());
@@ -301,9 +314,21 @@ impl<'a> Games<'a> {
         left.dedup_by(|a, b| std::ptr::eq(*a, *b));
         right.dedup_by(|a, b| std::ptr::eq(*a, *b));
 
+        let table = self.game_table.borrow();
+        let key = (
+            left.iter().map(|&x| (x as *const Game).addr()).collect(),
+            right.iter().map(|&x| (x as *const Game).addr()).collect(),
+        );
+        if let Some(value) = table.get(&key) {
+            return value;
+        }
+        drop(table);
+
         let left = self.slices.alloc_slice(&left);
         let right = self.slices.alloc_slice(&right);
-        self.games.alloc(Game { left, right })
+        let game = self.games.alloc(Game { left, right });
+        self.game_table.borrow_mut().insert(key, game);
+        game
     }
 
     fn bypass_reversible(
@@ -311,40 +336,38 @@ impl<'a> Games<'a> {
         mut left: Vec<&'a Game<'a>>,
         mut right: Vec<&'a Game<'a>>,
     ) -> (Vec<&'a Game<'a>>, Vec<&'a Game<'a>>) {
+        let ltable = RefCell::new(HashMap::new());
+        let rtable = RefCell::new(HashMap::new());
+        left = Self::remove_dominated(left, |a, b| self.le(a, b));
+        right = Self::remove_dominated(right, |a, b| self.le(b, a));
         'outer: loop {
             let start_left = left.len();
             let start_right = right.len();
-            left = Self::remove_dominated(left.to_vec(), |a, b| self.le(a, b));
-            right = Self::remove_dominated(right.to_vec(), |a, b| self.le(b, a));
 
-            let g = Game {
-                left: &left.clone(),
-                right: &right.clone(),
-            };
-
-            for i in 0..g.left.len() {
-                let gl = g.left.get(i).unwrap();
-                for ii in 0..gl.right.len() {
-                    let glr = gl.right.get(ii).unwrap();
-                    if self.le(*glr, &g) {
-                        left.extend(left.get(i).unwrap().right.get(ii).unwrap().left);
+            for i in 0..left.len() {
+                let gl = left[i];
+                for &glr in gl.right {
+                    if self.le_options(glr, &left, &right, &ltable, &rtable) {
+                        left.extend(glr.left);
                         left.remove(i);
                         continue 'outer;
                     }
                 }
             }
 
-            for i in 0..g.right.len() {
-                let gr = g.right.get(i).unwrap();
-                for ii in 0..gr.left.len() {
-                    let grl = gr.left.get(ii).unwrap();
-                    if self.le(&g, *grl) {
-                        right.extend(right.get(i).unwrap().left.get(ii).unwrap().right);
+            for i in 0..right.len() {
+                let gr = right[i];
+                for &grl in gr.left {
+                    if self.options_le(&left, &right, grl, &ltable, &rtable) {
+                        right.extend(grl.right);
                         right.remove(i);
                         continue 'outer;
                     }
                 }
             }
+
+            left = Self::remove_dominated(left, |a, b| self.le(a, b));
+            right = Self::remove_dominated(right, |a, b| self.le(b, a));
 
             if start_left == left.len() && start_right == right.len() {
                 break;
@@ -355,7 +378,7 @@ impl<'a> Games<'a> {
 
     fn remove_dominated(
         options: Vec<&'a Game<'a>>,
-        dominated: impl Fn(&Game, &Game) -> bool,
+        dominated: impl Fn(&'a Game, &'a Game) -> bool,
     ) -> Vec<&'a Game<'a>> {
         let mut kept = Vec::new();
         for x in options {
@@ -370,47 +393,155 @@ impl<'a> Games<'a> {
 
     fn add(&'a self, lhs: &'a Game<'a>, rhs: &'a Game<'a>) -> &'a Game<'a> {
         self.add_calls.update(|x| x + 1);
+
+        let table = self.add_table.borrow();
+        let key = {
+            let a = (lhs as *const Game).addr();
+            let b = (rhs as *const Game).addr();
+            if a > b { (a, b) } else { (b, a) }
+        };
+        if let Some(value) = table.get(&key) {
+            return value;
+        }
+        drop(table);
+
         let mut left = vec![];
         let mut right = vec![];
         left.extend(lhs.left.iter().map(|x| self.add(x, rhs)));
         left.extend(rhs.left.iter().map(|x| self.add(x, lhs)));
         right.extend(lhs.right.iter().map(|x| self.add(x, rhs)));
         right.extend(rhs.right.iter().map(|x| self.add(x, lhs)));
-        self.game(&left, &right)
+
+        let res = self.game(&left, &right);
+        self.add_table.borrow_mut().insert(key, res);
+        res
     }
 
     fn neg(&'a self, game: &'a Game<'a>) -> &'a Game<'a> {
         self.neg_calls.update(|x| x + 1);
+
+        let table = self.neg_table.borrow();
+        let key = (game as *const Game).addr();
+        if let Some(value) = table.get(&key) {
+            return value;
+        }
+        drop(table);
+
         let left = game.right.iter().map(|x| self.neg(x)).collect::<Vec<_>>();
         let right = game.left.iter().map(|x| self.neg(x)).collect::<Vec<_>>();
-        self.game(&left, &right)
+
+        let game = self.game(&left, &right);
+        self.neg_table.borrow_mut().insert(key, game);
+        game
     }
 
-    fn le(&self, lhs: &Game, rhs: &Game) -> bool {
+    fn le(&self, lhs: &'a Game<'a>, rhs: &'a Game<'a>) -> bool {
         self.le_calls.update(|x| x + 1);
+        if std::ptr::eq(lhs, rhs) {
+            return true;
+        }
+
+        let table = self.le_table.borrow();
+        let key = ((lhs as *const Game).addr(), (rhs as *const Game).addr());
+        if let Some(b) = table.get(&key) {
+            return *b;
+        }
+        drop(table);
+
+        let f = |b: bool| {
+            self.le_table.borrow_mut().insert(key, b);
+        };
+
         for g in lhs.left {
             if self.le(rhs, g) {
+                f(false);
                 return false;
             }
         }
         for g in rhs.right {
             if self.le(g, lhs) {
+                f(false);
                 return false;
             }
         }
+        f(true);
+        true
+    }
+
+    fn options_le(
+        &self,
+        left: &[&'a Game<'a>],
+        right: &[&'a Game<'a>],
+        rhs: &'a Game<'a>,
+        ltable: &RefCell<HashMap<usize, bool>>,
+        rtable: &RefCell<HashMap<usize, bool>>,
+    ) -> bool {
+        self.le_calls.update(|x| x + 1);
+
+        let key = (rhs as *const Game).addr();
+        if let Some(b) = ltable.borrow().get(&key) {
+            return *b;
+        }
+
+        let f = |b: bool| {
+            ltable.borrow_mut().insert(key, b);
+        };
+
+        for &g in left {
+            if self.le(rhs, g) {
+                f(false);
+                return false;
+            }
+        }
+        for &g in rhs.right {
+            if self.le_options(g, left, right, ltable, rtable) {
+                f(false);
+                return false;
+            }
+        }
+        f(true);
+        true
+    }
+
+    fn le_options(
+        &self,
+        lhs: &'a Game<'a>,
+        left: &[&'a Game<'a>],
+        right: &[&'a Game<'a>],
+        ltable: &RefCell<HashMap<usize, bool>>,
+        rtable: &RefCell<HashMap<usize, bool>>,
+    ) -> bool {
+        self.le_calls.update(|x| x + 1);
+
+        let key = (lhs as *const Game).addr();
+        if let Some(b) = rtable.borrow().get(&key) {
+            return *b;
+        }
+
+        let f = |b: bool| {
+            rtable.borrow_mut().insert(key, b);
+        };
+
+        for &g in lhs.left {
+            if self.options_le(left, right, g, ltable, rtable) {
+                f(false);
+                return false;
+            }
+        }
+        for &g in right {
+            if self.le(g, lhs) {
+                f(false);
+                return false;
+            }
+        }
+        f(true);
         true
     }
 }
 
-fn time<T>(name: &str, f: impl FnOnce() -> T) -> T {
-    let start = std::time::Instant::now();
-    let result = f();
-    println!("{name}: {:?}", start.elapsed());
-    result
-}
-
 fn main() {
-    let ctx = Games::new(1 << 22, 1 << 22);
+    let start = std::time::Instant::now();
+    let ctx = Games::new(1 << 20, 1 << 20);
     let zero = G::new(&ctx, &[], &[]);
     let star = G::new(&ctx, &[zero], &[zero]);
     let one = G::new(&ctx, &[zero], &[]);
@@ -418,27 +549,24 @@ fn main() {
     let g = G::new(&ctx, &[zero], &[star]);
     let up = G::new(&ctx, &[zero], &[star]);
 
-    println!("{}", g + g + g + g + g + g + g);
-    println!("{}", one + negative_one);
-    println!("{}", one - negative_one);
-    println!("{}", one - negative_one + star - g + zero);
+    let a = g + g + g + g + g + g + g;
+    let b = one + negative_one - a;
+    let c = a + b - a + star - g;
+    let d = a + b + c + b;
     let mut nimbers = vec![zero];
-    for _ in 1..=6 {
+    for _ in 1..=100 {
         let next = G::new(&ctx, &nimbers, &nimbers);
         nimbers.push(next);
     }
 
-    for n in [10, 15, 20] {
-        let sum = time(&format!("{n}↑ "), || (1..n).fold(up, |acc, _| acc + up));
-        println!("{sum}");
+    for n in [10, 15, 20, 40, 100] {
+        let sum = (1..n).fold(up, |acc, _| acc + up);
     }
 
-    for n in [4, 5, 6] {
-        let sum = time(&format!("*1 + ... + *{n}"), || {
-            nimbers[2..=n].iter().fold(nimbers[1], |acc, &x| acc + x)
-        });
-        println!("{sum}");
+    for n in [4, 5, 6, 10, 30, 50] {
+        let sum = nimbers[2..=n].iter().fold(nimbers[1], |acc, &x| acc + x);
     }
+    println!("total time: {:?}", start.elapsed());
     ctx.print_info();
 }
 
@@ -480,7 +608,7 @@ fn dedup_same_pointer() {
     let ctx = Games::new(100, 100);
     let zero = G::new(&ctx, &[], &[]);
     let g = G::new(&ctx, &[zero, zero, zero], &[zero, zero]);
-    assert_eq!(g.to_string(), "{0 | 0}");
+    assert_eq!(g.to_string(), "*");
     assert_eq!(g.game.left.len(), 1);
 }
 
