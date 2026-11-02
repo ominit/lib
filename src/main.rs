@@ -5,8 +5,46 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{Debug, Display},
+    hash::BuildHasherDefault,
     ops::{Add, Neg, Sub},
 };
+
+type GameHashMap<K, V> = HashMap<K, V, BuildHasherDefault<GameHasher>>;
+
+#[derive(Default)]
+struct GameHasher {
+    state: u64,
+}
+
+impl std::hash::Hasher for GameHasher {
+    fn finish(&self) -> u64 {
+        self.state.rotate_left(21)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<{ size_of::<usize>() }>();
+
+        for c in chunks {
+            self.write_usize(usize::from_le_bytes(*c));
+        }
+
+        if rest.is_empty() {
+            return;
+        }
+
+        let mut b: usize = 0;
+        for r in rest {
+            b = b << 8;
+            b |= *r as usize;
+        }
+        self.write_usize(b);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.state = self.state.wrapping_add(i as u64);
+        self.state = self.state.wrapping_mul(0x34fa3906e323fd23);
+    }
+}
 
 struct Arena<T> {
     items: RefCell<Vec<T>>,
@@ -263,10 +301,10 @@ struct Games<'a> {
     add_calls: Cell<usize>,
     game_calls: Cell<usize>,
     neg_calls: Cell<usize>,
-    game_table: RefCell<HashMap<(Vec<usize>, Vec<usize>), &'a Game<'a>>>,
-    add_table: RefCell<HashMap<(usize, usize), &'a Game<'a>>>,
-    le_table: RefCell<HashMap<(usize, usize), bool>>,
-    neg_table: RefCell<HashMap<usize, &'a Game<'a>>>,
+    game_table: RefCell<GameHashMap<(Vec<usize>, Vec<usize>), &'a Game<'a>>>,
+    add_table: RefCell<GameHashMap<(usize, usize), &'a Game<'a>>>,
+    le_table: RefCell<GameHashMap<(usize, usize), bool>>,
+    neg_table: RefCell<GameHashMap<usize, &'a Game<'a>>>,
 }
 
 impl<'a> Games<'a> {
@@ -278,10 +316,10 @@ impl<'a> Games<'a> {
             add_calls: Cell::new(0),
             game_calls: Cell::new(0),
             neg_calls: Cell::new(0),
-            game_table: RefCell::new(HashMap::new()),
-            add_table: RefCell::new(HashMap::new()),
-            le_table: RefCell::new(HashMap::new()),
-            neg_table: RefCell::new(HashMap::new()),
+            game_table: RefCell::new(GameHashMap::default()),
+            add_table: RefCell::new(GameHashMap::default()),
+            le_table: RefCell::new(GameHashMap::default()),
+            neg_table: RefCell::new(GameHashMap::default()),
         }
     }
 
@@ -336,43 +374,48 @@ impl<'a> Games<'a> {
         mut left: Vec<&'a Game<'a>>,
         mut right: Vec<&'a Game<'a>>,
     ) -> (Vec<&'a Game<'a>>, Vec<&'a Game<'a>>) {
-        let ltable = RefCell::new(HashMap::new());
-        let rtable = RefCell::new(HashMap::new());
+        let ltable = RefCell::new(GameHashMap::default());
+        let rtable = RefCell::new(GameHashMap::default());
         left = Self::remove_dominated(left, |a, b| self.le(a, b));
         right = Self::remove_dominated(right, |a, b| self.le(b, a));
-        'outer: loop {
-            let start_left = left.len();
-            let start_right = right.len();
 
-            for i in 0..left.len() {
-                let gl = left[i];
-                for &glr in gl.right {
-                    if self.le_options(glr, &left, &right, &ltable, &rtable) {
-                        left.extend(glr.left);
-                        left.remove(i);
-                        continue 'outer;
-                    }
+        let mut left_changed = false;
+        let mut i = 0;
+        'outer: while i < left.len() {
+            let gl = left[i];
+            for &glr in gl.right {
+                if self.le_options(glr, &left, &right, &ltable, &rtable) {
+                    left.extend(glr.left);
+                    left.remove(i);
+                    left_changed = true;
+                    continue 'outer;
                 }
             }
-
-            for i in 0..right.len() {
-                let gr = right[i];
-                for &grl in gr.left {
-                    if self.options_le(&left, &right, grl, &ltable, &rtable) {
-                        right.extend(grl.right);
-                        right.remove(i);
-                        continue 'outer;
-                    }
-                }
-            }
-
-            left = Self::remove_dominated(left, |a, b| self.le(a, b));
-            right = Self::remove_dominated(right, |a, b| self.le(b, a));
-
-            if start_left == left.len() && start_right == right.len() {
-                break;
-            }
+            i += 1;
         }
+
+        let mut right_changed = false;
+        let mut i = 0;
+        'outer: while i < right.len() {
+            let gr = right[i];
+            for &grl in gr.left {
+                if self.options_le(&left, &right, grl, &ltable, &rtable) {
+                    right.extend(grl.right);
+                    right.remove(i);
+                    right_changed = true;
+                    continue 'outer;
+                }
+            }
+            i += 1;
+        }
+
+        if left_changed {
+            left = Self::remove_dominated(left, |a, b| self.le(a, b));
+        }
+        if right_changed {
+            right = Self::remove_dominated(right, |a, b| self.le(b, a));
+        }
+
         (left, right)
     }
 
@@ -435,6 +478,7 @@ impl<'a> Games<'a> {
         game
     }
 
+    #[inline(always)]
     fn le(&self, lhs: &'a Game<'a>, rhs: &'a Game<'a>) -> bool {
         self.le_calls.update(|x| x + 1);
         if std::ptr::eq(lhs, rhs) {
@@ -447,8 +491,13 @@ impl<'a> Games<'a> {
             return *b;
         }
         drop(table);
+        self.le_cold(lhs, rhs)
+    }
 
+    #[inline(never)]
+    fn le_cold(&self, lhs: &'a Game<'a>, rhs: &'a Game<'a>) -> bool {
         let f = |b: bool| {
+            let key = ((lhs as *const Game).addr(), (rhs as *const Game).addr());
             self.le_table.borrow_mut().insert(key, b);
         };
 
@@ -473,8 +522,8 @@ impl<'a> Games<'a> {
         left: &[&'a Game<'a>],
         right: &[&'a Game<'a>],
         rhs: &'a Game<'a>,
-        ltable: &RefCell<HashMap<usize, bool>>,
-        rtable: &RefCell<HashMap<usize, bool>>,
+        ltable: &RefCell<GameHashMap<usize, bool>>,
+        rtable: &RefCell<GameHashMap<usize, bool>>,
     ) -> bool {
         self.le_calls.update(|x| x + 1);
 
@@ -508,8 +557,8 @@ impl<'a> Games<'a> {
         lhs: &'a Game<'a>,
         left: &[&'a Game<'a>],
         right: &[&'a Game<'a>],
-        ltable: &RefCell<HashMap<usize, bool>>,
-        rtable: &RefCell<HashMap<usize, bool>>,
+        ltable: &RefCell<GameHashMap<usize, bool>>,
+        rtable: &RefCell<GameHashMap<usize, bool>>,
     ) -> bool {
         self.le_calls.update(|x| x + 1);
 
@@ -540,34 +589,36 @@ impl<'a> Games<'a> {
 }
 
 fn main() {
-    let start = std::time::Instant::now();
-    let ctx = Games::new(1 << 20, 1 << 20);
-    let zero = G::new(&ctx, &[], &[]);
-    let star = G::new(&ctx, &[zero], &[zero]);
-    let one = G::new(&ctx, &[zero], &[]);
-    let negative_one = G::new(&ctx, &[], &[zero]);
-    let g = G::new(&ctx, &[zero], &[star]);
-    let up = G::new(&ctx, &[zero], &[star]);
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        let ctx = Games::new(1 << 20, 1 << 20);
+        let zero = G::new(&ctx, &[], &[]);
+        let star = G::new(&ctx, &[zero], &[zero]);
+        let one = G::new(&ctx, &[zero], &[]);
+        let negative_one = G::new(&ctx, &[], &[zero]);
+        let g = G::new(&ctx, &[zero], &[star]);
+        let up = G::new(&ctx, &[zero], &[star]);
 
-    let a = g + g + g + g + g + g + g;
-    let b = one + negative_one - a;
-    let c = a + b - a + star - g;
-    let d = a + b + c + b;
-    let mut nimbers = vec![zero];
-    for _ in 1..=100 {
-        let next = G::new(&ctx, &nimbers, &nimbers);
-        nimbers.push(next);
-    }
+        let a = g + g + g + g + g + g + g;
+        let b = one + negative_one - a;
+        let c = a + b - a + star - g;
+        let d = a + b + c + b;
+        let mut nimbers = vec![zero];
+        for _ in 1..=100 {
+            let next = G::new(&ctx, &nimbers, &nimbers);
+            nimbers.push(next);
+        }
 
-    for n in [10, 15, 20, 40, 100] {
-        let sum = (1..n).fold(up, |acc, _| acc + up);
-    }
+        for n in [10, 15, 20, 40, 100] {
+            let sum = (1..n).fold(up, |acc, _| acc + up);
+        }
 
-    for n in [4, 5, 6, 10, 30, 50] {
-        let sum = nimbers[2..=n].iter().fold(nimbers[1], |acc, &x| acc + x);
+        for n in [4, 5, 6, 10, 30, 50] {
+            let sum = nimbers[2..=n].iter().fold(nimbers[1], |acc, &x| acc + x);
+        }
+        println!("total time: {:?}", start.elapsed());
+        ctx.print_info();
     }
-    println!("total time: {:?}", start.elapsed());
-    ctx.print_info();
 }
 
 #[test]

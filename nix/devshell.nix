@@ -15,6 +15,7 @@
             rustToolchain
             rust-analyzer
             cargo-watch
+            samply
 
             just
 
